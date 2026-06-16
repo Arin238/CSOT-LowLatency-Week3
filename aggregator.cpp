@@ -52,11 +52,23 @@ inline void pin_to_core(int core) {
 }
 
 // ---- Per-thread partial table, cache-line aligned ---------------------------
+// Internal 64-byte padded aggregator to avoid cache-line straddling and
+// eliminate the 40-byte multiplication overhead (2x LEA instructions) in the
+// hot loop address calculation. 64-byte stride allows a single shift instruction.
+struct alignas(CACHE_LINE) InternalAgg {
+    std::uint64_t count = 0;
+    std::int64_t sum_price = 0;
+    std::uint64_t sum_qty = 0;
+    std::int64_t min_price = 0;
+    std::int64_t max_price = 0;
+    char _pad[24] = {0}; // 40 bytes + 24 bytes = 64 bytes
+};
+
 // Each worker gets its own PaddedPartial so no two workers' hot data shares
-// a cache line. sizeof(SymbolAgg) == 40, so 1024 rows == 40 KiB per worker.
+// a cache line. sizeof(InternalAgg) == 64, so 1024 rows == 64 KiB per worker.
 // The alignas(64) ensures the start of each table is on its own cache line.
 struct alignas(CACHE_LINE) PaddedPartial {
-    csot::SymbolAgg rows[1024];  // sized at compile time for the spec constant
+    InternalAgg rows[1024];  // sized at compile time for the spec constant
 };
 
 // ---- Thread pool synchronization state (per worker) -------------------------
@@ -85,7 +97,7 @@ struct alignas(CACHE_LINE) WorkerCtl {
 __attribute__((hot))
 static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
                          std::size_t begin, std::size_t end,
-                         csot::SymbolAgg* __restrict__ partial) {
+                         InternalAgg* __restrict__ partial) {
     const csot::AggTick* __restrict__ t = ticks + begin;
     const std::size_t count = end - begin;
 
@@ -98,9 +110,9 @@ static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
 
             // 2. Advanced Lookahead Prefetching:
             //    We peek into the future tick to find its random `symbol_id`.
-            //    Then we explicitly prefetch that symbol's `SymbolAgg` struct 
-            //    into the L1 cache (locality=3) with intent to write (rw=1).
-            //    This hides the L2->L1 capacity miss latency!
+            //    Then we explicitly prefetch that symbol's exactly 64-byte 
+            //    cache-line-aligned struct into the L1 cache (locality=3) 
+            //    with intent to write (rw=1).
             std::uint32_t future_s = t[i + PREFETCH_AHEAD].symbol_id;
             __builtin_prefetch(&partial[future_s], 1, 3);
         }
@@ -109,7 +121,7 @@ static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
         const std::int64_t  px = t[i].price;
         const std::uint32_t q  = t[i].qty;
 
-        csot::SymbolAgg& __restrict__ r = partial[s];
+        InternalAgg& __restrict__ r = partial[s];
 
         if (__builtin_expect(r.count == 0, 0)) {
             // First tick for this symbol in this partition
@@ -155,9 +167,9 @@ static void worker_main(int core_id, WorkerCtl* ctl, PaddedPartial* partial,
         const std::size_t end = ctl->end;
 
         // Zero our partial table (first-touch: the worker does this so pages
-        // are placed local on NUMA). Use memset for speed — SymbolAgg is
+        // are placed local on NUMA). Use memset for speed — InternalAgg is
         // trivial (all zeros is the canonical empty row).
-        std::memset(partial->rows, 0, num_symbols * sizeof(csot::SymbolAgg));
+        std::memset(partial->rows, 0, num_symbols * sizeof(InternalAgg));
 
         // Reduce our chunk
         reduce_chunk(ticks, begin, end, partial->rows);
@@ -298,7 +310,7 @@ public:
         const std::size_t hi0 = n / num_total_workers_;
         
         // Zero partial 0 (first-touch local to core 0)
-        std::memset(partials_[0].rows, 0, num_symbols_ * sizeof(csot::SymbolAgg));
+        std::memset(partials_[0].rows, 0, num_symbols_ * sizeof(InternalAgg));
         
         reduce_chunk(ticks, lo0, hi0, partials_[0].rows);
 
@@ -310,24 +322,31 @@ public:
         }
 
         // ---- Merge partials into out (serial, cheap) ------------------------
-        // Copy the first worker's partial as the base, then merge the rest.
-        // This avoids zeroing out[] and then adding — we memcpy once and
-        // merge (num_workers - 1) partials.
         const std::uint32_t ns = num_symbols_;
 
-        // Copy first partial as base
-        std::memcpy(out, partials_[0].rows, ns * sizeof(csot::SymbolAgg));
+        // Unpack first partial as base into `out`
+        for (std::uint32_t s = 0; s < ns; ++s) {
+            out[s].count     = partials_[0].rows[s].count;
+            out[s].sum_price = partials_[0].rows[s].sum_price;
+            out[s].sum_qty   = partials_[0].rows[s].sum_qty;
+            out[s].min_price = partials_[0].rows[s].min_price;
+            out[s].max_price = partials_[0].rows[s].max_price;
+        }
 
         // Merge remaining partials
         for (unsigned k = 1; k < num_total_workers_; ++k) {
-            const csot::SymbolAgg* __restrict__ p = partials_[k].rows;
+            const InternalAgg* __restrict__ p = partials_[k].rows;
             for (std::uint32_t s = 0; s < ns; ++s) {
                 if (p[s].count == 0) continue;  // skip empty — fast path
 
                 csot::SymbolAgg& __restrict__ r = out[s];
                 if (r.count == 0) {
-                    // First non-empty partial for this symbol: just copy
-                    r = p[s];
+                    // First non-empty partial for this symbol
+                    r.count     = p[s].count;
+                    r.sum_price = p[s].sum_price;
+                    r.sum_qty   = p[s].sum_qty;
+                    r.min_price = p[s].min_price;
+                    r.max_price = p[s].max_price;
                 } else {
                     // Merge: add counts/sums, min/max with guards
                     r.count     += p[s].count;
