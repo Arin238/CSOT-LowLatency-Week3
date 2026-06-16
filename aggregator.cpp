@@ -131,7 +131,7 @@ static void worker_main(int core_id, WorkerCtl* ctl, PaddedPartial* partial,
                p == 2) {
             // Hint to the CPU that we're in a spin loop (saves power,
             // avoids starving sibling hyperthread)
-            __builtin_ia32_pause();
+            std::this_thread::yield();
         }
 
         if (p == 3) {
@@ -168,15 +168,17 @@ class FastAggregator final : public csot::Aggregator {
     // Per-worker control blocks (spin flags + work params).
     WorkerCtl* ctls_ = nullptr;
 
-    // Worker threads (persistent pool).
+    // Worker threads (persistent pool). We only spawn (N-1) background workers,
+    // as the main thread will process chunk 0.
     std::thread* workers_ = nullptr;
 
-    unsigned num_workers_ = 0;
+    unsigned num_total_workers_ = 0;
+    unsigned num_bg_workers_ = 0;
 
 public:
     ~FastAggregator() override {
-        // Signal all workers to shut down
-        for (unsigned k = 0; k < num_workers_; ++k) {
+        // Signal all bg workers to shut down
+        for (unsigned k = 0; k < num_bg_workers_; ++k) {
             // Wait for any in-progress work to finish
             while (ctls_[k].phase.load(std::memory_order_acquire) == 1) {
                 __builtin_ia32_pause();
@@ -184,7 +186,7 @@ public:
             ctls_[k].phase.store(3, std::memory_order_release);
         }
         // Join all worker threads
-        for (unsigned k = 0; k < num_workers_; ++k) {
+        for (unsigned k = 0; k < num_bg_workers_; ++k) {
             if (workers_[k].joinable()) {
                 workers_[k].join();
             }
@@ -197,34 +199,44 @@ public:
     void on_init(std::uint32_t num_symbols) override {
         num_symbols_ = num_symbols;
 
-        // Determine worker count: use 4 or hardware_concurrency, whichever
+        // Determine total worker count: use 4 or hardware_concurrency, whichever
         // is smaller. The judge has exactly 4 vCPUs.
         unsigned hw = std::thread::hardware_concurrency();
         if (hw == 0) hw = NUM_WORKERS;
-        num_workers_ = std::min(hw, NUM_WORKERS);
+        num_total_workers_ = std::min(hw, NUM_WORKERS);
+        num_bg_workers_ = num_total_workers_ > 1 ? num_total_workers_ - 1 : 0;
 
-        // Allocate cache-line-aligned partial tables (one per worker).
+        // Allocate cache-line-aligned partial tables (one per total worker).
         // Using aligned new to guarantee the alignas(64) is respected.
-        partials_ = new PaddedPartial[num_workers_];
+        partials_ = new PaddedPartial[num_total_workers_];
 
-        // Allocate control blocks (one per worker).
-        ctls_ = new WorkerCtl[num_workers_];
+        // Allocate control blocks (one per background worker).
+        if (num_bg_workers_ > 0) {
+            ctls_ = new WorkerCtl[num_bg_workers_];
+            workers_ = new std::thread[num_bg_workers_];
 
-        // Spawn persistent worker threads (cold path — done once).
-        workers_ = new std::thread[num_workers_];
-        for (unsigned k = 0; k < num_workers_; ++k) {
-            ctls_[k].phase.store(0, std::memory_order_relaxed);
-            workers_[k] = std::thread(worker_main, static_cast<int>(k),
-                                      &ctls_[k], &partials_[k], num_symbols_);
+            // Spawn persistent worker threads (cold path — done once).
+            for (unsigned k = 0; k < num_bg_workers_; ++k) {
+                ctls_[k].phase.store(0, std::memory_order_relaxed);
+                // Worker k gets core_id k+1 (main thread gets core 0 conceptually)
+                // Worker k processes chunk k+1, and its results go to partials_[k+1]
+                workers_[k] = std::thread(worker_main, static_cast<int>(k + 1),
+                                          &ctls_[k], &partials_[k + 1], num_symbols_);
+            }
         }
     }
 
     void run(const csot::AggTick* ticks, std::size_t n,
              csot::SymbolAgg* out) override {
-        // ---- Dispatch work to pool workers (zero allocation) ----------------
-        for (unsigned k = 0; k < num_workers_; ++k) {
-            const std::size_t lo = n *  k        / num_workers_;
-            const std::size_t hi = n * (k + 1u)  / num_workers_;
+        // Pin main thread to core 0 to keep it out of the bg workers' way
+        // and keep its cache warm.
+        pin_to_core(0);
+
+        // ---- Dispatch work to bg workers (zero allocation) ------------------
+        for (unsigned k = 0; k < num_bg_workers_; ++k) {
+            unsigned part = k + 1;
+            const std::size_t lo = n *  part       / num_total_workers_;
+            const std::size_t hi = n * (part + 1u) / num_total_workers_;
 
             ctls_[k].ticks = ticks;
             ctls_[k].begin = lo;
@@ -234,8 +246,17 @@ public:
             ctls_[k].phase.store(1, std::memory_order_release);
         }
 
-        // ---- Wait for all workers to finish ---------------------------------
-        for (unsigned k = 0; k < num_workers_; ++k) {
+        // ---- Main thread does chunk 0 ---------------------------------------
+        const std::size_t lo0 = 0;
+        const std::size_t hi0 = n / num_total_workers_;
+        
+        // Zero partial 0 (first-touch local to core 0)
+        std::memset(partials_[0].rows, 0, num_symbols_ * sizeof(csot::SymbolAgg));
+        
+        reduce_chunk(ticks, lo0, hi0, partials_[0].rows);
+
+        // ---- Wait for all bg workers to finish ------------------------------
+        for (unsigned k = 0; k < num_bg_workers_; ++k) {
             while (ctls_[k].phase.load(std::memory_order_acquire) != 2) {
                 __builtin_ia32_pause();
             }
@@ -251,7 +272,7 @@ public:
         std::memcpy(out, partials_[0].rows, ns * sizeof(csot::SymbolAgg));
 
         // Merge remaining partials
-        for (unsigned k = 1; k < num_workers_; ++k) {
+        for (unsigned k = 1; k < num_total_workers_; ++k) {
             const csot::SymbolAgg* __restrict__ p = partials_[k].rows;
             for (std::uint32_t s = 0; s < ns; ++s) {
                 if (p[s].count == 0) continue;  // skip empty — fast path
@@ -272,7 +293,7 @@ public:
         }
 
         // ---- Reset worker phases for next run() call ------------------------
-        for (unsigned k = 0; k < num_workers_; ++k) {
+        for (unsigned k = 0; k < num_bg_workers_; ++k) {
             ctls_[k].phase.store(0, std::memory_order_release);
         }
     }
