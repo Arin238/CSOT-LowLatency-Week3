@@ -124,13 +124,13 @@ cmd_tsan() {
     build_tsan
     echo ""
     echo -e "${YELLOW}▸ Running under ThreadSanitizer (tiny.ticks)...${NC}"
-    ./build-tsan/agg_runner $STREAM_TINY >/dev/null 2>&1 && \
+    ./build-tsan/agg_runner $STREAM_TINY >/dev/null && \
         echo -e "${GREEN}✓ TSan clean — no data races detected${NC}" || \
         echo -e "${RED}✗ TSan found issues (see output above)${NC}"
     echo ""
     echo -e "${YELLOW}▸ Running under ThreadSanitizer (large.ticks)...${NC}"
     gen_large
-    ./build-tsan/agg_runner $STREAM_LARGE >/dev/null 2>&1 && \
+    ./build-tsan/agg_runner $STREAM_LARGE >/dev/null && \
         echo -e "${GREEN}✓ TSan clean on large stream${NC}" || \
         echo -e "${RED}✗ TSan found issues on large stream${NC}"
 }
@@ -139,7 +139,7 @@ cmd_asan() {
     build_asan
     echo ""
     echo -e "${YELLOW}▸ Running under AddressSanitizer (tiny.ticks)...${NC}"
-    ./build-asan/agg_runner $STREAM_TINY >/dev/null 2>&1 && \
+    ./build-asan/agg_runner $STREAM_TINY >/dev/null && \
         echo -e "${GREEN}✓ ASan clean${NC}" || \
         echo -e "${RED}✗ ASan found issues${NC}"
 }
