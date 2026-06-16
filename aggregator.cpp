@@ -90,9 +90,19 @@ static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
     const std::size_t count = end - begin;
 
     for (std::size_t i = 0; i < count; ++i) {
-        // Prefetch a future tick to hide memory latency
         if (i + PREFETCH_AHEAD < count) {
-            __builtin_prefetch(&t[i + PREFETCH_AHEAD], 0, 1);
+            // 1. Hardware Prefetcher handles the linear `ticks` stream perfectly,
+            //    so we don't strictly need to prefetch `t`. However, we can use 
+            //    prefetchnta (0, 0) to avoid polluting L1/L2 caches with the stream.
+            __builtin_prefetch(&t[i + PREFETCH_AHEAD], 0, 0);
+
+            // 2. Advanced Lookahead Prefetching:
+            //    We peek into the future tick to find its random `symbol_id`.
+            //    Then we explicitly prefetch that symbol's `SymbolAgg` struct 
+            //    into the L1 cache (locality=3) with intent to write (rw=1).
+            //    This hides the L2->L1 capacity miss latency!
+            std::uint32_t future_s = t[i + PREFETCH_AHEAD].symbol_id;
+            __builtin_prefetch(&partial[future_s], 1, 3);
         }
 
         const std::uint32_t s  = t[i].symbol_id;
