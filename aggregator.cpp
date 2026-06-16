@@ -199,10 +199,16 @@ public:
     void on_init(std::uint32_t num_symbols) override {
         num_symbols_ = num_symbols;
 
-        // Determine total worker count: use 4 or hardware_concurrency, whichever
-        // is smaller. The judge has exactly 4 vCPUs.
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = NUM_WORKERS;
+        // Determine total worker count based on the CPU affinity mask.
+        // This makes it respect `taskset` bounds correctly, instead of
+        // blindly using the system-wide hardware_concurrency().
+        unsigned hw = 1;
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            hw = CPU_COUNT(&cpuset);
+        }
+
         num_total_workers_ = std::min(hw, NUM_WORKERS);
         num_bg_workers_ = num_total_workers_ > 1 ? num_total_workers_ - 1 : 0;
 
@@ -216,11 +222,33 @@ public:
             workers_ = new std::thread[num_bg_workers_];
 
             // Spawn persistent worker threads (cold path — done once).
+            unsigned worker_idx = 0;
+            for (int core = 0; core < CPU_SETSIZE && worker_idx < num_bg_workers_; ++core) {
+                // Only spawn workers on cores we are allowed to use
+                if (CPU_ISSET(core, &cpuset)) {
+                    // Skip the first allowed core, as we reserve that for the main thread
+                    if (worker_idx == 0 && CPU_COUNT(&cpuset) > num_bg_workers_) {
+                        // Wait, easier approach: just use an incrementing logical index
+                    }
+                }
+            }
+            
             for (unsigned k = 0; k < num_bg_workers_; ++k) {
                 ctls_[k].phase.store(0, std::memory_order_relaxed);
-                // Worker k gets core_id k+1 (main thread gets core 0 conceptually)
-                // Worker k processes chunk k+1, and its results go to partials_[k+1]
-                workers_[k] = std::thread(worker_main, static_cast<int>(k + 1),
+                // We'll just pass a logical worker ID (k+1). The worker will
+                // pin itself. To be perfectly accurate with taskset, we should
+                // map this to the allowed cores in cpuset.
+                int target_core = -1;
+                unsigned seen = 0;
+                for (int c = 0; c < CPU_SETSIZE; ++c) {
+                    if (CPU_ISSET(c, &cpuset)) {
+                        if (seen == k + 1) { target_core = c; break; }
+                        seen++;
+                    }
+                }
+                if (target_core == -1) target_core = k + 1; // fallback
+
+                workers_[k] = std::thread(worker_main, target_core,
                                           &ctls_[k], &partials_[k + 1], num_symbols_);
             }
         }
@@ -228,9 +256,18 @@ public:
 
     void run(const csot::AggTick* ticks, std::size_t n,
              csot::SymbolAgg* out) override {
-        // Pin main thread to core 0 to keep it out of the bg workers' way
+        // Pin main thread to the first allowed core to keep it out of the bg workers' way
         // and keep its cache warm.
-        pin_to_core(0);
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &cpuset)) {
+                    pin_to_core(c);
+                    break;
+                }
+            }
+        }
 
         // ---- Dispatch work to bg workers (zero allocation) ------------------
         for (unsigned k = 0; k < num_bg_workers_; ++k) {
