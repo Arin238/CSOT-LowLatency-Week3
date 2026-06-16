@@ -6,8 +6,7 @@
 //      cost in the timed run()).
 //    - Per-thread partial tables aligned to 64-byte cache-line boundaries
 //      (eliminates false sharing entirely).
-//    - Workers pinned to distinct cores via sched_setaffinity (eliminates
-//      scheduler migration jitter).
+//    - Workers pinned to distinct allowed cores (no migrations).
 //    - Branchless min/max using conditional moves in the inner reduction loop.
 //    - Branchless merge phase — no per-symbol branches when combining partials.
 //    - Workers initialize (first-touch) their own partial tables for
@@ -41,12 +40,12 @@ constexpr int CACHE_LINE = 64;
 // avoids oversubscription and matches the hardware.
 constexpr unsigned NUM_WORKERS = 4;
 
-// ---- Pin calling thread to a specific core ----------------------------------
-inline void pin_to_core(int core) {
+// ---- Pin calling thread to a specific core (returns true on success) -------
+inline bool pin_to_core(int core) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
-    sched_setaffinity(0, sizeof(set), &set);
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
 
 // ---- Per-thread partial table, cache-line aligned ---------------------------
@@ -128,13 +127,12 @@ static void worker_main(int core_id, WorkerCtl* ctl, PaddedPartial* partial,
     pin_to_core(core_id);
 
     for (;;) {
-        // Spin-wait for work or shutdown signal
+        // Spin-wait for work or shutdown signal (userspace only, no migrations)
         int p;
         while ((p = ctl->phase.load(std::memory_order_acquire)) == 0 ||
                p == 2) {
-            // Hint to the CPU that we're in a spin loop (saves power,
-            // avoids starving sibling hyperthread)
-            std::this_thread::yield();
+            // Pure userspace spin-loop hint; avoids scheduler interaction
+            __builtin_ia32_pause();
         }
 
         if (p == 3) {
@@ -208,41 +206,42 @@ public:
     void on_init(std::uint32_t num_symbols) override {
         num_symbols_ = num_symbols;
 
-        // Determine total worker count based on the CPU affinity mask.
-        // This makes it respect `taskset` bounds correctly, instead of
-        // blindly using the system-wide hardware_concurrency().
-        unsigned hw = 1;
+        // ---- Build list of allowed cores from our affinity mask ----------------
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
-            hw = CPU_COUNT(&cpuset);
+        if (sched_getaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+            // Fallback: allow all cores (won't pin but won't crash)
+            for (int i = 0; i < CPU_SETSIZE; ++i) CPU_SET(i, &cpuset);
         }
+        int allowed_cores[CPU_SETSIZE];
+        int num_allowed = 0;
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (CPU_ISSET(c, &cpuset)) {
+                allowed_cores[num_allowed++] = c;
+            }
+        }
+
+        // ---- Determine worker count --------------------------------------------
+        unsigned hw = static_cast<unsigned>(num_allowed);
+        if (hw == 0) hw = 1;   // safety, will use core 0
 
         num_total_workers_ = std::min(hw, NUM_WORKERS);
         num_bg_workers_ = num_total_workers_ > 1 ? num_total_workers_ - 1 : 0;
 
-        // Allocate cache-line-aligned partial tables (one per total worker).
-        // Using aligned new to guarantee the alignas(64) is respected.
+        // ---- Allocate partial tables and control blocks -----------------------
         partials_ = new PaddedPartial[num_total_workers_];
-
-        // Allocate control blocks (one per background worker).
         if (num_bg_workers_ > 0) {
             ctls_ = new WorkerCtl[num_bg_workers_];
             workers_ = new std::thread[num_bg_workers_];
 
             for (unsigned k = 0; k < num_bg_workers_; ++k) {
                 ctls_[k].phase.store(0, std::memory_order_relaxed);
-                // Map to a distinct allowed core. The first allowed core is
-                // reserved for the main thread, so we start with the second.
-                int target_core = -1;
-                unsigned seen = 0;
-                for (int c = 0; c < CPU_SETSIZE; ++c) {
-                    if (CPU_ISSET(c, &cpuset)) {
-                        if (seen == k + 1) { target_core = c; break; }
-                        seen++;
-                    }
-                }
-                if (target_core == -1) target_core = k + 1; // fallback
+
+                // Assign each background worker a distinct allowed core,
+                // wrapping around if there are more workers than cores.
+                // We reserve allowed_cores[0] for the main thread.
+                int core_idx = (k + 1) % num_allowed;
+                int target_core = allowed_cores[core_idx];
 
                 workers_[k] = std::thread(worker_main, target_core,
                                           &ctls_[k], &partials_[k + 1], num_symbols_);
@@ -252,8 +251,7 @@ public:
 
     void run(const csot::AggTick* ticks, std::size_t n,
              csot::SymbolAgg* out) override {
-        // Pin main thread to the first allowed core to keep it out of the bg workers' way
-        // and keep its cache warm.
+        // ---- Pin main thread to the first allowed core ------------------------
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
