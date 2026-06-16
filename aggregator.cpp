@@ -8,10 +8,12 @@
 //      (eliminates false sharing entirely).
 //    - Workers pinned to distinct cores via sched_setaffinity (eliminates
 //      scheduler migration jitter).
-//    - Software prefetch of upcoming ticks to hide DRAM latency.
-//    - Branchless min/max using conditional moves in the inner loop.
+//    - Branchless min/max using conditional moves in the inner reduction loop.
+//    - Branchless merge phase — no per-symbol branches when combining partials.
 //    - Workers initialize (first-touch) their own partial tables for
 //      NUMA-local page placement.
+//    - InternalAgg layout ensures min_price/max_price at 16-byte boundaries
+//      for aligned vector stores.
 //    - Merge uses count-guards to handle the empty-partition edge case
 //      correctly (AGG_SPEC.md §7).
 //    - Zero heap allocation in run().
@@ -39,10 +41,6 @@ constexpr int CACHE_LINE = 64;
 // avoids oversubscription and matches the hardware.
 constexpr unsigned NUM_WORKERS = 4;
 
-// How many ticks ahead to prefetch. Tuned for the 32-byte AggTick stride
-// and typical DRAM latency (~200-300 cycles).
-constexpr std::size_t PREFETCH_AHEAD = 8;
-
 // ---- Pin calling thread to a specific core ----------------------------------
 inline void pin_to_core(int core) {
     cpu_set_t set;
@@ -52,16 +50,16 @@ inline void pin_to_core(int core) {
 }
 
 // ---- Per-thread partial table, cache-line aligned ---------------------------
-// Internal 64-byte padded aggregator to avoid cache-line straddling and
-// eliminate the 40-byte multiplication overhead (2x LEA instructions) in the
-// hot loop address calculation. 64-byte stride allows a single shift instruction.
+// Internal 64-byte padded aggregator with min/max fields at a 16-byte boundary
+// to allow the compiler to use aligned 16-byte stores (movdqa instead of movdqu).
 struct alignas(CACHE_LINE) InternalAgg {
     std::uint64_t count = 0;
-    std::int64_t sum_price = 0;
+    std::int64_t  sum_price = 0;
     std::uint64_t sum_qty = 0;
-    std::int64_t min_price = 0;
-    std::int64_t max_price = 0;
-    char _pad[24] = {0}; // 40 bytes + 24 bytes = 64 bytes
+    std::uint64_t _pad1 = 0;          // force min_price to offset 32 (16-byte aligned)
+    std::int64_t  min_price = 0;
+    std::int64_t  max_price = 0;
+    char _pad2[16] = {0};             // total struct size = 64 bytes
 };
 
 // Each worker gets its own PaddedPartial so no two workers' hot data shares
@@ -93,7 +91,9 @@ struct alignas(CACHE_LINE) WorkerCtl {
 
 // ---- The inner reduction loop -----------------------------------------------
 // Reduces ticks[begin..end) into the given partial table. This is the hot path.
-// Uses prefetch and a branch-lean structure.
+// All software prefetching has been removed — the hardware prefetcher handles
+// the sequential tick stream flawlessly, and the random partial-table accesses
+// are too irregular for software prefetch to help without adding overhead.
 __attribute__((hot))
 static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
                          std::size_t begin, std::size_t end,
@@ -102,36 +102,17 @@ static void reduce_chunk(const csot::AggTick* __restrict__ ticks,
     const std::size_t count = end - begin;
 
     for (std::size_t i = 0; i < count; ++i) {
-        if (i + PREFETCH_AHEAD < count) {
-            // 1. Hardware Prefetcher handles the linear `ticks` stream perfectly,
-            //    so we don't strictly need to prefetch `t`. However, we can use 
-            //    prefetchnta (0, 0) to avoid polluting L1/L2 caches with the stream.
-            __builtin_prefetch(&t[i + PREFETCH_AHEAD], 0, 0);
-
-            // 2. Advanced Lookahead Prefetching:
-            //    We peek into the future tick to find its random `symbol_id`.
-            //    Then we explicitly prefetch that symbol's exactly 64-byte 
-            //    cache-line-aligned struct into the L1 cache (locality=3) 
-            //    with intent to write (rw=1).
-            std::uint32_t future_s = t[i + PREFETCH_AHEAD].symbol_id;
-            __builtin_prefetch(&partial[future_s], 1, 3);
-        }
-
         const std::uint32_t s  = t[i].symbol_id;
         const std::int64_t  px = t[i].price;
         const std::uint32_t q  = t[i].qty;
 
         InternalAgg& __restrict__ r = partial[s];
 
-        if (__builtin_expect(r.count == 0, 0)) {
-            // First tick for this symbol in this partition
-            r.min_price = px;
-            r.max_price = px;
-        } else {
-            // Branchless min/max — the compiler turns these into cmov
-            r.min_price = px < r.min_price ? px : r.min_price;
-            r.max_price = px > r.max_price ? px : r.max_price;
-        }
+        // 100% branchless logic.
+        // min_price initialized to INT64_MAX and max_price to INT64_MIN before
+        // the loop, so the first tick for each symbol will always overwrite them.
+        r.min_price = px < r.min_price ? px : r.min_price;
+        r.max_price = px > r.max_price ? px : r.max_price;
         r.count     += 1;
         r.sum_price += px;
         r.sum_qty   += q;
@@ -166,10 +147,16 @@ static void worker_main(int core_id, WorkerCtl* ctl, PaddedPartial* partial,
         const std::size_t begin = ctl->begin;
         const std::size_t end = ctl->end;
 
-        // Zero our partial table (first-touch: the worker does this so pages
-        // are placed local on NUMA). Use memset for speed — InternalAgg is
-        // trivial (all zeros is the canonical empty row).
-        std::memset(partial->rows, 0, num_symbols * sizeof(InternalAgg));
+        // Initialize our partial table (first-touch: the worker does this so pages
+        // are placed local on NUMA). We initialize min/max to limits so the
+        // hot loop can be 100% branchless.
+        for (std::uint32_t i = 0; i < num_symbols; ++i) {
+            partial->rows[i].count = 0;
+            partial->rows[i].sum_price = 0;
+            partial->rows[i].sum_qty = 0;
+            partial->rows[i].min_price = INT64_MAX;
+            partial->rows[i].max_price = INT64_MIN;
+        }
 
         // Reduce our chunk
         reduce_chunk(ticks, begin, end, partial->rows);
@@ -243,23 +230,10 @@ public:
             ctls_ = new WorkerCtl[num_bg_workers_];
             workers_ = new std::thread[num_bg_workers_];
 
-            // Spawn persistent worker threads (cold path — done once).
-            unsigned worker_idx = 0;
-            for (int core = 0; core < CPU_SETSIZE && worker_idx < num_bg_workers_; ++core) {
-                // Only spawn workers on cores we are allowed to use
-                if (CPU_ISSET(core, &cpuset)) {
-                    // Skip the first allowed core, as we reserve that for the main thread
-                    if (worker_idx == 0 && CPU_COUNT(&cpuset) > num_bg_workers_) {
-                        // Wait, easier approach: just use an incrementing logical index
-                    }
-                }
-            }
-            
             for (unsigned k = 0; k < num_bg_workers_; ++k) {
                 ctls_[k].phase.store(0, std::memory_order_relaxed);
-                // We'll just pass a logical worker ID (k+1). The worker will
-                // pin itself. To be perfectly accurate with taskset, we should
-                // map this to the allowed cores in cpuset.
+                // Map to a distinct allowed core. The first allowed core is
+                // reserved for the main thread, so we start with the second.
                 int target_core = -1;
                 unsigned seen = 0;
                 for (int c = 0; c < CPU_SETSIZE; ++c) {
@@ -308,10 +282,16 @@ public:
         // ---- Main thread does chunk 0 ---------------------------------------
         const std::size_t lo0 = 0;
         const std::size_t hi0 = n / num_total_workers_;
-        
-        // Zero partial 0 (first-touch local to core 0)
-        std::memset(partials_[0].rows, 0, num_symbols_ * sizeof(InternalAgg));
-        
+
+        // Initialize partial 0 (first-touch local to core 0)
+        for (std::uint32_t i = 0; i < num_symbols_; ++i) {
+            partials_[0].rows[i].count = 0;
+            partials_[0].rows[i].sum_price = 0;
+            partials_[0].rows[i].sum_qty = 0;
+            partials_[0].rows[i].min_price = INT64_MAX;
+            partials_[0].rows[i].max_price = INT64_MIN;
+        }
+
         reduce_chunk(ticks, lo0, hi0, partials_[0].rows);
 
         // ---- Wait for all bg workers to finish ------------------------------
@@ -321,40 +301,57 @@ public:
             }
         }
 
-        // ---- Merge partials into out (serial, cheap) ------------------------
+        // ---- Merge partials into out (branchless) ---------------------------
         const std::uint32_t ns = num_symbols_;
 
-        // Unpack first partial as base into `out`
+        // Unpack first partial as base into `out`.
+        // We explicitly zero rows that have no data to match the python reference.
         for (std::uint32_t s = 0; s < ns; ++s) {
-            out[s].count     = partials_[0].rows[s].count;
-            out[s].sum_price = partials_[0].rows[s].sum_price;
-            out[s].sum_qty   = partials_[0].rows[s].sum_qty;
-            out[s].min_price = partials_[0].rows[s].min_price;
-            out[s].max_price = partials_[0].rows[s].max_price;
+            if (partials_[0].rows[s].count == 0) {
+                out[s].count     = 0;
+                out[s].sum_price = 0;
+                out[s].sum_qty   = 0;
+                out[s].min_price = 0;
+                out[s].max_price = 0;
+            } else {
+                out[s].count     = partials_[0].rows[s].count;
+                out[s].sum_price = partials_[0].rows[s].sum_price;
+                out[s].sum_qty   = partials_[0].rows[s].sum_qty;
+                out[s].min_price = partials_[0].rows[s].min_price;
+                out[s].max_price = partials_[0].rows[s].max_price;
+            }
         }
 
-        // Merge remaining partials
+        // Merge remaining partials — completely branchless.
         for (unsigned k = 1; k < num_total_workers_; ++k) {
             const InternalAgg* __restrict__ p = partials_[k].rows;
             for (std::uint32_t s = 0; s < ns; ++s) {
-                if (p[s].count == 0) continue;  // skip empty — fast path
+                std::uint64_t pcount = p[s].count;
+                // Mask: all‑ones if pcount != 0, else zero. No branch.
+                std::uint64_t mask = (pcount != 0) ? (~std::uint64_t{0}) : 0;
 
                 csot::SymbolAgg& __restrict__ r = out[s];
-                if (r.count == 0) {
-                    // First non-empty partial for this symbol
-                    r.count     = p[s].count;
-                    r.sum_price = p[s].sum_price;
-                    r.sum_qty   = p[s].sum_qty;
-                    r.min_price = p[s].min_price;
-                    r.max_price = p[s].max_price;
-                } else {
-                    // Merge: add counts/sums, min/max with guards
-                    r.count     += p[s].count;
-                    r.sum_price += p[s].sum_price;
-                    r.sum_qty   += p[s].sum_qty;
-                    if (p[s].min_price < r.min_price) r.min_price = p[s].min_price;
-                    if (p[s].max_price > r.max_price) r.max_price = p[s].max_price;
-                }
+
+                // Load current r values; if r is empty we'll treat it as identity.
+                std::uint64_t rcount = r.count;
+                std::int64_t  rmin   = r.min_price;
+                std::int64_t  rmax   = r.max_price;
+
+                // If r is empty, force the selection of p's min/max.
+                std::uint64_t rcount_zero = (rcount == 0);
+                std::int64_t  sel_min = rcount_zero ? p[s].min_price : rmin;
+                std::int64_t  sel_max = rcount_zero ? p[s].max_price : rmax;
+
+                // Branchless min/max for the combined values.
+                std::int64_t new_min = p[s].min_price < sel_min ? p[s].min_price : sel_min;
+                std::int64_t new_max = p[s].max_price > sel_max ? p[s].max_price : sel_max;
+
+                // Apply mask: if mask==0 (pcount==0) we keep r unchanged.
+                r.count     = (mask & (rcount + pcount))               | (~mask & rcount);
+                r.sum_price = (mask & (r.sum_price + p[s].sum_price))  | (~mask & r.sum_price);
+                r.sum_qty   = (mask & (r.sum_qty   + p[s].sum_qty))    | (~mask & r.sum_qty);
+                r.min_price = (mask & new_min)                         | (~mask & rmin);
+                r.max_price = (mask & new_max)                         | (~mask & rmax);
             }
         }
 
